@@ -21,4 +21,9 @@ public class AccountController {
     public AccountResponse getAccount(@PathVariable UUID id) {
         return accountService.getAccount(id);
     }
+
+    @GetMapping("/{id}/transactions")
+    public AccountTransactionHistoryResponse getTransactionHistory(@PathVariable UUID id) {
+        return accountService.getTransactionHistory(id);
+    }
 }

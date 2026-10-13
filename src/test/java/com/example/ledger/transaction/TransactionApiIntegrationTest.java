@@ -21,6 +21,8 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.Statement;
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -35,6 +37,7 @@ import javax.sql.DataSource;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -52,6 +55,8 @@ class TransactionApiIntegrationTest {
             UUID.fromString("00000000-0000-0000-0000-000000000002"));
     private static final UUID ACCOUNT_C = Objects.requireNonNull(
             UUID.fromString("00000000-0000-0000-0000-000000000003"));
+    private static final UUID HISTORY_OTHER_ACCOUNT = Objects.requireNonNull(
+            UUID.fromString("00000000-0000-0000-0000-000000000200"));
     private static final List<UUID> CREDIT_SOURCE_IDS = temporaryAccountIds();
 
     @Container
@@ -99,6 +104,7 @@ class TransactionApiIntegrationTest {
         for (UUID accountId : CREDIT_SOURCE_IDS) {
             jdbcTemplate.update("DELETE FROM accounts WHERE id = ?", accountId);
         }
+        jdbcTemplate.update("DELETE FROM accounts WHERE id = ?", HISTORY_OTHER_ACCOUNT);
         jdbcTemplate.update("UPDATE accounts SET balance = opening_balance");
     }
 
@@ -163,6 +169,140 @@ class TransactionApiIntegrationTest {
         assertThat(sourceEntry.add(destinationEntry)).isEqualByComparingTo(BigDecimal.ZERO);
         assertBalanceMatchesOpeningPlusEntries(ACCOUNT_A);
         assertBalanceMatchesOpeningPlusEntries(ACCOUNT_B);
+    }
+
+    @Test
+    void seededAccountWithNoTransfersHasEmptyHistory() throws Exception {
+        mockMvc.perform(get("/accounts/{id}/transactions", ACCOUNT_A))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items").isArray())
+                .andExpect(jsonPath("$.items").isEmpty());
+    }
+
+    @Test
+    void unknownAccountHistoryReturnsNotFound() throws Exception {
+        UUID unknownId = Objects.requireNonNull(
+                UUID.fromString("00000000-0000-0000-0000-000000000099"));
+
+        mockMvc.perform(get("/accounts/{id}/transactions", unknownId))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("NOT_FOUND"));
+    }
+
+    @Test
+    void sourceAndDestinationHistoryUseSignedLedgerEntryAmounts() throws Exception {
+        TransactionResponse posted = postTransfer(
+                ACCOUNT_A, ACCOUNT_B, "100.0000", "history-source-destination"
+        );
+
+        mockMvc.perform(get("/accounts/{id}/transactions", ACCOUNT_A))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items.length()").value(1))
+                .andExpect(jsonPath("$.items[0].transactionId")
+                        .value(posted.transactionId().toString()))
+                .andExpect(jsonPath("$.items[0].type").value("TRANSFER"))
+                .andExpect(jsonPath("$.items[0].amount").value("-100.0000"))
+                .andExpect(jsonPath("$.items[0].currency").value("SGD"))
+                .andExpect(jsonPath("$.items[0].reversalOf").doesNotExist());
+
+        mockMvc.perform(get("/accounts/{id}/transactions", ACCOUNT_B))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items.length()").value(1))
+                .andExpect(jsonPath("$.items[0].transactionId")
+                        .value(posted.transactionId().toString()))
+                .andExpect(jsonPath("$.items[0].amount").value("100.0000"))
+                .andExpect(jsonPath("$.items[0].currency").value("SGD"))
+                .andExpect(jsonPath("$.items[0].reversalOf").doesNotExist());
+    }
+
+    @Test
+    void multipleAndIrrelevantTransfersAreOrderedByCreationTimeAndTransactionId()
+            throws Exception {
+        TransactionResponse first = postTransfer(
+                ACCOUNT_A, ACCOUNT_B, "100.0000", "history-order-first"
+        );
+        TransactionResponse second = postTransfer(
+                ACCOUNT_A, ACCOUNT_B, "20.0000", "history-order-second"
+        );
+        jdbcTemplate.update(
+                """
+                INSERT INTO accounts (id, currency, opening_balance, balance)
+                VALUES (?, 'SGD', 100.0000, 100.0000)
+                """,
+                HISTORY_OTHER_ACCOUNT
+        );
+        TransactionResponse irrelevant = postTransfer(
+                ACCOUNT_B, HISTORY_OTHER_ACCOUNT, "30.0000", "history-order-irrelevant"
+        );
+
+        Timestamp sameCreationTime =
+                Timestamp.from(Instant.parse("2026-01-01T00:00:00Z"));
+        jdbcTemplate.update(
+                "UPDATE ledger_transactions SET created_at = ? WHERE id IN (?, ?)",
+                sameCreationTime,
+                first.transactionId(),
+                second.transactionId()
+        );
+        List<UUID> expectedOrder = jdbcTemplate.query(
+                """
+                SELECT id
+                FROM ledger_transactions
+                WHERE id IN (?, ?)
+                ORDER BY created_at ASC, id ASC
+                """,
+                (resultSet, rowNumber) -> resultSet.getObject("id", UUID.class),
+                first.transactionId(),
+                second.transactionId()
+        );
+
+        mockMvc.perform(get("/accounts/{id}/transactions", ACCOUNT_A))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items.length()").value(2))
+                .andExpect(jsonPath("$.items[0].transactionId")
+                        .value(expectedOrder.get(0).toString()))
+                .andExpect(jsonPath("$.items[1].transactionId")
+                        .value(expectedOrder.get(1).toString()));
+
+        assertThat(expectedOrder).containsExactlyInAnyOrder(
+                first.transactionId(),
+                second.transactionId()
+        );
+        assertThat(expectedOrder).doesNotContain(irrelevant.transactionId());
+        for (int i = 0; i < expectedOrder.size(); i++) {
+            UUID transactionId = expectedOrder.get(i);
+            BigDecimal expectedAmount = transactionId.equals(first.transactionId())
+                    ? new BigDecimal("-100.0000")
+                    : new BigDecimal("-20.0000");
+            mockMvc.perform(get("/accounts/{id}/transactions", ACCOUNT_A))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.items[" + i + "].amount")
+                            .value(expectedAmount.toPlainString()));
+        }
+    }
+
+    @Test
+    void idempotentReplayAppearsOnlyOnceInAccountHistory() throws Exception {
+        TransactionResponse first = postTransfer(
+                ACCOUNT_A, ACCOUNT_B, "100.0000", "history-idempotent-replay"
+        );
+        MvcResult replay = mockMvc.perform(post("/transactions")
+                        .contentType("application/json")
+                        .header(IDEMPOTENCY_HEADER, "history-idempotent-replay")
+                        .content(transferJson(ACCOUNT_A, ACCOUNT_B, "100")))
+                .andExpect(status().isOk())
+                .andReturn();
+        TransactionResponse replayed = objectMapper.readValue(
+                replay.getResponse().getContentAsString(),
+                TransactionResponse.class
+        );
+
+        assertThat(replayed.transactionId()).isEqualTo(first.transactionId());
+        mockMvc.perform(get("/accounts/{id}/transactions", ACCOUNT_A))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items.length()").value(1))
+                .andExpect(jsonPath("$.items[0].transactionId")
+                        .value(first.transactionId().toString()))
+                .andExpect(jsonPath("$.items[0].amount").value("-100.0000"));
     }
 
     @Test
@@ -605,6 +745,24 @@ class TransactionApiIntegrationTest {
             executor.shutdownNow();
             assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
         }
+    }
+
+    private TransactionResponse postTransfer(
+            UUID sourceId,
+            UUID destinationId,
+            String amount,
+            String idempotencyKey
+    ) throws Exception {
+        MvcResult result = mockMvc.perform(post("/transactions")
+                        .contentType("application/json")
+                        .header(IDEMPOTENCY_HEADER, idempotencyKey)
+                        .content(transferJson(sourceId, destinationId, amount)))
+                .andExpect(status().isCreated())
+                .andReturn();
+        return objectMapper.readValue(
+                result.getResponse().getContentAsString(),
+                TransactionResponse.class
+        );
     }
 
     private void awaitBlockedClaims(int expectedCount) throws InterruptedException {
