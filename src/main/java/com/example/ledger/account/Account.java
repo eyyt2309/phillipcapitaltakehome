@@ -47,6 +47,10 @@ public class Account {
         return balance;
     }
 
+    public void setBalance(BigDecimal balance) {
+        this.balance = balance;
+    }
+
     public OffsetDateTime getCreatedAt() {
         return createdAt;
     }
