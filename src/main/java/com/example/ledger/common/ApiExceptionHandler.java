@@ -1,6 +1,7 @@
 package com.example.ledger.common;
 
 import com.example.ledger.account.AccountNotFoundException;
+import com.example.ledger.reconciliation.InvalidAsOfDateException;
 import com.example.ledger.transaction.CurrencyMismatchException;
 import com.example.ledger.transaction.DuplicateReversalException;
 import com.example.ledger.transaction.IdempotencyConflictException;
@@ -160,6 +161,20 @@ public class ApiExceptionHandler {
         problem.setInstance(java.net.URI.create(request.getRequestURI()));
         problem.setProperty("code", "INVALID_REQUEST");
         return problem;
+    }
+
+    @ExceptionHandler(InvalidAsOfDateException.class)
+    public ProblemDetail handleInvalidAsOfDate(
+            InvalidAsOfDateException exception,
+            HttpServletRequest request
+    ) {
+        return problem(
+                HttpStatus.BAD_REQUEST.value(),
+                "Invalid asOfDate",
+                "INVALID_AS_OF_DATE",
+                exception,
+                request
+        );
     }
 
     private ProblemDetail problem(
