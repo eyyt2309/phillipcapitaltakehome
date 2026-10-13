@@ -290,7 +290,7 @@ The FX invariants are that the source balance changes by exactly the recorded so
 
 ## 9. Reconciliation and conservation
 
-`GET /reconciliation` calculates a report dynamically when requested. The operator runs it on demand at month-end; there is no scheduled job. No reconciliation-run table or historical balance snapshots are required. An `asOfDate` report reconstructs balances from ledger entries only and cannot compare them with a stored historical balance.
+`GET /reconciliation` calculates a report dynamically when requested. The operator runs it on demand at month-end; there is no scheduled job. No reconciliation-run table or historical balance snapshots are required. An `asOfDate` report reconstructs balances from ledger entries only and cannot compare them with a stored historical balance. Dates and cutoffs use UTC; `asOfDate=YYYY-MM-DD` includes entries before 00:00 UTC on the following day. Historical results omit stored balances and differences.
 
 For every account, calculate:
 
@@ -298,7 +298,7 @@ For every account, calculate:
 expected balance = opening_balance + SUM(ledger_entries.amount)
 ```
 
-For current reconciliation, compare expected and stored `accounts.balance`, returning discrepancies without repairing them. For a supplied `asOfDate`, sum only entries through 23:59:59.999999 UTC on that date and report the reconstructed balance; historical comparison to a stored balance is not possible without snapshots.
+For current reconciliation, compare expected and stored `accounts.balance`, returning discrepancies without repairing them. For a supplied `asOfDate`, sum entries before the start of the next UTC day and report reconstructed balances; historical comparison to a stored balance is not possible without snapshots.
 
 For every transfer, verify there are exactly two entries with the expected account IDs, signs, currencies, and amounts. For a reversal, verify its entries are the sign-inverted effects of the referenced original transaction. Also verify:
 
@@ -307,7 +307,7 @@ For every transfer, verify there are exactly two entries with the expected accou
 - Each FX transaction's persisted rate produces its persisted destination amount under the defined scale and rounding rule.
 - Current aggregate balances per currency equal the opening balances in that currency plus the signed ledger entries in that currency. Same-currency transfers have zero net effect; an FX transfer decreases the source-currency total and increases the destination-currency total by its recorded amounts. Do not claim cross-currency transfers conserve raw amounts within one currency.
 
-The endpoint reports discrepancies with account/transaction identifiers and expected versus observed values. It never silently changes balances or entries.
+The endpoint reports discrepancies with account/transaction identifiers and expected versus observed values. It never silently changes balances or entries. Currency totals are kept separate by currency. The read-only endpoint uses normal `READ_COMMITTED` isolation and does not lock accounts; concurrent postings can commit between its queries. A large production reconciliation may require `REPEATABLE_READ`, database snapshots, or accounting cutoffs.
 
 ## 10. Errors
 
@@ -331,6 +331,7 @@ Use a consistent RFC 9457 `ProblemDetail` response and a stable `code` extension
 | Insufficient funds, self-transfer, duplicate reversal | 409 |
 | Same idempotency key with a different request | 409 |
 | Invalid amount, scale, or unsupported FX pair | 422 |
+| Invalid reconciliation `asOfDate` | 400 |
 | Unexpected server error | 500 |
 
 Log unexpected errors with a request/correlation ID and do not expose database messages to callers.
@@ -347,6 +348,7 @@ Use JUnit 5 and PostgreSQL Testcontainers for repository, API, rollback, and con
 - **Reversal:** post and reverse a transfer; verify balances return to their prior values, the original is unchanged, and both transactions appear in history. Verify a second reversal is rejected.
 - **FX:** verify a configured USD-to-SGD example (100 at 1.35 yields 135.0000), and verify the rate/amount are retained and reconciliation checks the rate relationship.
 - **Queries/reconciliation:** verify stable account history ordering, current balance reconciliation, a historical `asOfDate` calculation, same-currency conservation, and detection of an intentionally corrupted balance fixture.
+- **Reconciliation invariants:** validate same-currency net entries, FX metadata/rate/entries, reversal metadata and inverse entries, separate per-currency totals, and reporting of corrupt fixtures without repair.
 - **API errors:** verify status and `ProblemDetail` for not-found, conflicts, and validation failures.
 
 ## 12. Assumptions and trade-offs
@@ -359,6 +361,7 @@ Use JUnit 5 and PostgreSQL Testcontainers for repository, API, rollback, and con
 - The ledger has exactly two entries per transfer/reversal. The schema and service can evolve to more entries for fees or per-currency clearing, but those features are not prebuilt.
 - `balance` is a cached projection for efficient reads; entries are the audit trail and reconciliation source.
 - Reconciliation is computed on demand. Persisted runs, snapshots, scheduling, dashboards, authentication, authorization, account ownership, and audit streaming are future improvements.
+- Historical reconciliation reconstructs ledger balances as of the requested UTC date; current stored balances are not historical snapshots. Production month-end operations may persist snapshots or reconciliation runs.
 - Transaction type currently supports `TRANSFER` and `REVERSAL`; future types can be introduced with a migration and service behavior without redesigning the three core tables.
 
 ## 13. Proposed package structure

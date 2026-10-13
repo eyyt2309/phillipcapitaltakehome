@@ -22,11 +22,10 @@ seeds development accounts; balances can also be initialized in test fixtures.
 Deposits, withdrawals, partial reversals, authentication, and authorization are
 outside this take-home's implemented scope.
 
-**Reconciliation status:** the assignment and [design](docs/design.md) call for
-current/month-end reconciliation, but the current application does not yet
-implement a reconciliation endpoint or reconciliation tests. The design
-describes the intended on-demand checks; this README does not represent them as
-available functionality.
+Reconciliation is implemented as a read-only, on-demand endpoint. It checks
+account balances against ledger entries and validates transfer, FX, and
+reversal invariants. Historical requests reconstruct balances from ledger
+entries; historical stored-balance snapshots are not maintained.
 
 ## Technology
 
@@ -38,12 +37,28 @@ available functionality.
 - JUnit 5, Spring Boot Test, and Testcontainers
 - Docker Compose for local PostgreSQL
 
-## How it works
+## Architecture
 
-The application follows a controller → service → repository → PostgreSQL
-structure. Controllers handle HTTP input and responses, while
-`TransactionService` applies transfer and reversal rules inside database
-transactions.
+```text
+HTTP client
+    |
+    v
+Spring MVC controllers
+    |
+    v
+Application services
+    |
+    v
+Spring Data JPA / focused SQL queries
+    |
+    v
+PostgreSQL <--- Flyway migrations
+```
+
+Controllers validate HTTP input and format responses. `TransactionService`
+owns atomic transfers, reversals, idempotency, and FX application.
+`ReconciliationService` performs read-only ledger checks. Repositories handle
+account locks, persistence, and reconciliation queries.
 
 The database uses three tables:
 
@@ -63,6 +78,11 @@ For same-currency transfers, the source debit and destination credit are equal
 and offset each other. For cross-currency transfers, the entries are in
 different currencies and must not be summed as if they were the same unit.
 Account history returns each entry's signed amount in that account's currency.
+
+Transaction and ledger-entry rows are append-only by application behavior.
+Transfer and reversal posting is atomic: transaction metadata, account
+projections, ledger entries, and the idempotency claim commit or roll back
+together.
 
 ### Idempotency and reversals
 
@@ -111,16 +131,47 @@ A new transfer returns `201 Created`; an idempotent replay returns `200 OK`.
 The response includes the transaction ID, type, status, account IDs, source
 and destination amounts/currencies, optional exchange rate, and timestamp.
 
+Example FX request using the seeded USD and SGD accounts:
+
+```powershell
+curl.exe -i -X POST http://localhost:8080/transactions `
+  -H "Content-Type: application/json" `
+  -H "Idempotency-Key: example-fx-001" `
+  -d '{"sourceAccountId":"00000000-0000-0000-0000-000000000003","destinationAccountId":"00000000-0000-0000-0000-000000000002","amount":"100.0000"}'
+```
+
+The deterministic USD→SGD rate produces source debit `-100.0000 USD` and
+destination credit `135.0000 SGD`. The response includes
+`"exchangeRate":"1.35000000"`; same-currency responses have
+`"exchangeRate":null`.
+
 ### `POST /transactions/{transactionId}/reversals`
 
 Posts a full reversal of an existing transfer. Provide an
 `Idempotency-Key` header. A new reversal returns `201 Created`; a replay
 returns `200 OK`.
 
+Example:
+
+```powershell
+$transactionId = "replace-with-the-transaction-id-from-the-transfer-response"
+curl.exe -i -X POST "http://localhost:8080/transactions/$transactionId/reversals" `
+  -H "Idempotency-Key: example-reversal-001"
+```
+
+The response identifies the new `REVERSAL` transaction and its `reversalOf`
+transaction ID. It retains the original transaction's account, amount,
+currency, and FX-rate metadata; the actual reversal effect is expressed by
+sign-inverted ledger entries.
+
 ### `GET /accounts/{id}`
 
 Returns the account ID, currency, and current balance. An unknown account
 returns `404 Not Found`.
+
+```powershell
+curl.exe http://localhost:8080/accounts/00000000-0000-0000-0000-000000000001
+```
 
 Example response:
 
@@ -140,49 +191,134 @@ ID and type, signed amount, account currency, timestamp, and (for a reversal)
 the original transaction ID. The endpoint currently returns the full history
 without pagination.
 
+```powershell
+curl.exe http://localhost:8080/accounts/00000000-0000-0000-0000-000000000001/transactions
+```
+
+### `GET /reconciliation`
+
+Reconciles every account against its opening balance and ledger entries. The
+response includes per-account results, separate currency totals, and
+transaction checks. Discrepancies are returned as a successful `200 OK`
+reconciliation response with overall status `DISCREPANCY`; the endpoint never
+repairs data.
+
+```powershell
+curl.exe http://localhost:8080/reconciliation
+```
+
+To reconstruct the ledger through a UTC calendar date, use `asOfDate`:
+
+```powershell
+curl.exe "http://localhost:8080/reconciliation?asOfDate=2026-10-31"
+```
+
+An historical request includes entries before midnight UTC at the start of
+the following day. Since historical balance snapshots are not stored,
+historical account results contain reconstructed expected balances but omit
+stored balances and differences. Invalid dates return `400 Bad Request` with
+code `INVALID_AS_OF_DATE`.
+
+Example response shape:
+
+```json
+{
+  "asOfDate": null,
+  "historicalReconstructionOnly": false,
+  "status": "OK",
+  "accountResults": [
+    {
+      "accountId": "00000000-0000-0000-0000-000000000001",
+      "currency": "SGD",
+      "openingBalance": "1000.0000",
+      "ledgerEffect": "0.0000",
+      "expectedBalance": "1000.0000",
+      "storedBalance": "1000.0000",
+      "difference": "0.0000",
+      "status": "OK"
+    }
+  ],
+  "currencyTotals": [
+    {
+      "currency": "SGD",
+      "openingBalanceTotal": "1500.0000",
+      "ledgerEffectTotal": "0.0000",
+      "expectedBalanceTotal": "1500.0000",
+      "storedBalanceTotal": "1500.0000",
+      "difference": "0.0000",
+      "status": "OK"
+    },
+    {
+      "currency": "USD",
+      "openingBalanceTotal": "1000.0000",
+      "ledgerEffectTotal": "0.0000",
+      "expectedBalanceTotal": "1000.0000",
+      "storedBalanceTotal": "1000.0000",
+      "difference": "0.0000",
+      "status": "OK"
+    }
+  ],
+  "transactionChecks": {
+    "checked": 0,
+    "discrepancies": []
+  }
+}
+```
+
 ### Errors
 
 Errors use Spring's RFC 9457 `ProblemDetail` response format with a stable
 `code` property. Examples include `NOT_FOUND`, `INSUFFICIENT_FUNDS`,
 `SELF_TRANSFER`, `IDEMPOTENCY_KEY_REUSED`, `DUPLICATE_REVERSAL`, and
-`UNSUPPORTED_CURRENCY_PAIR`. Invalid requests are rejected rather than
-silently rounded or posted.
+`UNSUPPORTED_CURRENCY_PAIR`. An invalid reconciliation date returns
+`INVALID_AS_OF_DATE`. Reconciliation discrepancies are reported in the
+`200 OK` reconciliation response rather than as HTTP errors. Invalid requests
+are rejected rather than silently rounded or posted.
 
 ## Run locally
 
 Prerequisites:
 
-- JDK 21
-- Maven 3.9 or newer
 - Docker with the Docker Compose plugin
 
-From the repository root, start PostgreSQL:
+From the repository root, build and start both the application and PostgreSQL:
 
-```powershell
-docker compose up -d postgres
+```sh
+docker compose up --build
 ```
 
-The Compose service creates a `ledger` database with the development defaults
-`ledger` / `ledger_dev_password` and publishes PostgreSQL on port `5432`.
-These credentials are for local development only. Override them before using
-the application in any shared or deployed environment.
+To start both services in the background:
 
-Start the application:
-
-```powershell
-mvn spring-boot:run
+```sh
+docker compose up --build -d
 ```
 
-Flyway creates the schema and seeds these sample accounts:
+Compose waits for PostgreSQL to pass its health check before starting the
+application. The database is published on port `5432`, and the application is
+available at `http://localhost:8080`. Flyway creates the schema and seeds the
+sample accounts on startup. The Compose file uses the fixed `ledger`/`ledger`
+credentials for local development only; do not reuse them in shared or
+deployed environments.
+
+View service logs:
+
+```sh
+docker compose logs -f app
+```
+
+Stop the services:
+
+```sh
+docker compose down
+```
+
+Seeded sample accounts:
 
 | Account ID | Currency | Opening balance |
 | --- | --- | ---: |
 | `00000000-0000-0000-0000-000000000001` | SGD | 1000.0000 |
 | `00000000-0000-0000-0000-000000000002` | SGD | 500.0000 |
 | `00000000-0000-0000-0000-000000000003` | USD | 1000.0000 |
-
-The connection settings can be overridden with `DB_HOST`, `DB_PORT`,
-`DB_NAME`, `DB_USER`, and `DB_PASSWORD`.
 
 Example request from PowerShell:
 
@@ -198,13 +334,14 @@ The example transfers SGD 100 from account 1 to account 2.
 ## Run tests
 
 ```powershell
-mvn test
+mvn verify
 ```
 
 Integration tests start PostgreSQL 17 with Testcontainers and therefore require
 a working Docker daemon. The tests cover account reads, transfer and FX
 posting, history ordering, idempotent retries and key conflicts, validation,
-rollback, concurrent debits/credits, and reversal behavior.
+rollback, concurrent debits/credits, reversal behavior, and reconciliation
+including historical reconstruction and corrupted-data reporting.
 
 ## Assumptions and trade-offs
 
@@ -266,8 +403,8 @@ opening balance + ledger entries
 
 The trade-off is faster balance reads at the cost of needing reconciliation to
 detect divergence caused by bugs, manual database changes, or failed
-invariants. Reconciliation is part of the design, but is not currently exposed
-by the application API.
+invariants. The on-demand reconciliation endpoint detects and reports
+divergence but does not repair it.
 
 ### Ledger entries are authoritative for financial effects
 
@@ -338,6 +475,14 @@ originally posted at `USD -> SGD = 1.35000000` and the configured rate later
 changes, replaying the request with the same key still returns the original
 transaction and rate.
 
+The transfer key is claimed with PostgreSQL `INSERT ... ON CONFLICT DO
+NOTHING` inside the same transaction as the posting. The unique database
+constraint is the final guard against concurrent duplicate submissions. With
+`READ_COMMITTED`, a losing request waits for the winner and then reads the
+committed result using a fresh statement snapshot. If posting fails, the
+claim rolls back too, so the key can be retried. Reusing a key with a
+different request hash returns `409 Conflict`.
+
 ### Concurrency and locking
 
 Account rows are locked pessimistically before balances are changed. All
@@ -347,6 +492,11 @@ as `A -> B` and `B -> A`, reducing deadlock risk.
 
 Funds are checked only after all affected account locks have been acquired, so
 concurrent transactions do not spend from stale balances.
+
+The reconciliation endpoint is read-only, uses `READ_COMMITTED`, and does not
+lock all accounts. Consequently, concurrent commits may occur between its
+queries; its output is suitable for this small take-home but is not a
+point-in-time database snapshot.
 
 ### Atomic posting
 
@@ -456,20 +606,36 @@ checked against their stored conversion relationship rather than by summing
 different currencies. Reversal entries should be exact sign inverses of the
 original entries.
 
-Reconciliation is intended to detect and report discrepancies, not
-automatically repair ledger state. It is not currently implemented as an API
-endpoint.
+`GET /reconciliation` detects and reports discrepancies; it does not
+automatically repair ledger state. Current requests compare stored and
+ledger-derived balances. The endpoint checks same-currency transfer entry
+counts and net effects, FX rates and converted destination amounts, and
+reversal metadata and exact inverse entries. Currency totals are calculated
+separately by currency; values in different currencies are never combined.
+The response reports an overall `OK` or `DISCREPANCY` status, per-account
+results, per-currency totals, and a transaction check count with discrepancy
+codes and details. A discrepancy is a reconciliation result, not a failed
+HTTP request.
 
 ### Historical reconstruction
 
-Historical balances can be reconstructed from an opening balance plus ledger
-entries through a selected cutoff. The system does not currently persist
-historical balance snapshots. Therefore, an `asOfDate` reconciliation would
-represent a ledger-derived historical reconstruction, not a comparison
-against a separately stored historical account balance.
+Historical balances are reconstructed from opening balances plus ledger
+entries before the start of the next UTC day for the selected `asOfDate`. The
+system does not persist historical balance snapshots. Therefore, historical
+results are ledger-derived reconstructions, not comparisons against stored
+historical account balances.
 
 A production system may persist daily closing balances, reconciliation runs,
 month-end snapshots, or signed accounting periods.
+
+The reconciliation service uses read-only `READ_COMMITTED` isolation and
+does not lock accounts. A posting can commit between its separate read
+queries, so results are not guaranteed to represent one database snapshot
+during concurrent writes. This is a deliberate take-home trade-off; a larger
+production reconciliation could use `REPEATABLE_READ`, database snapshots,
+accounting cutoffs, and persisted month-end runs. Month-end reconciliation in
+this project is an on-demand `asOfDate` query, not a scheduled or persisted
+workflow.
 
 ### Scope boundary
 
