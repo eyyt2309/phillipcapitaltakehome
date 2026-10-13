@@ -208,19 +208,280 @@ rollback, concurrent debits/credits, and reversal behavior.
 
 ## Assumptions and trade-offs
 
-- An account has one fixed three-letter currency and supports at most four
-  fractional digits.
-- Opening balances are stored on the account for this exercise. In a
-  production ledger, initial funding would normally be represented by ledger
-  entries.
-- Transfers and reversals are append-only, each with two signed ledger entries.
-- Full reversals only; if the inverse entries would overdraw an account, the
-  reversal is rejected.
-- The FX provider is deterministic and local. Rate sourcing, freshness, fees,
-  and FX clearing accounts are outside the exercise's scope.
-- Balances are a projection for reads; the entries are the transaction audit
-  trail. Reconciliation is a planned feature, not currently available through
-  the API.
+This implementation intentionally prioritizes correctness, auditability, and reliability over feature completeness. In a financial system, an incomplete feature set is preferable to incorrect balances, duplicated transfers, inconsistent ledger state, or behaviour that cannot be reliably explained and audited.
+
+For that reason, the design focuses first on strong transactional guarantees, deterministic behaviour, immutable financial history, idempotency, and reconciliation. More production-oriented capabilities are intentionally left out where they would add complexity without improving the core correctness of the ledger.
+
+The following assumptions and trade-offs define the boundaries of the exercise.
+
+### Account and currency model
+
+Each account is denominated in exactly one fixed three-letter currency code,
+such as `SGD` or `USD`. An account does not hold multiple currencies or
+sub-balances. Cross-currency transfers are movements between accounts with
+different fixed currencies.
+
+Amounts are represented with `BigDecimal` and persisted using fixed-precision
+numeric columns. The exercise supports up to four fractional digits for
+account balances and transaction amounts. This simplifies validation,
+reconciliation rules, and balance handling while avoiding currency-specific
+minor-unit complexity.
+
+A production system may instead support currency-specific decimal precision,
+multi-currency wallets, sub-ledgers per currency, or configurable currency
+metadata.
+
+### Opening balances
+
+Each account stores an `opening_balance`. The ledger-derived expected balance
+is:
+
+```text
+expected balance =
+opening balance + sum of ledger entries
+```
+
+Opening balances are stored directly on the account for simplicity. In a
+stricter production ledger, initial funding would normally be represented
+through explicit ledger transactions and entries so that the ledger explains
+the entire balance history from zero.
+
+### Current balance as a projection
+
+Each account stores a current `balance` for efficient reads. It is updated
+atomically whenever a transaction posts. Ledger entries remain the immutable
+audit trail describing how the account reached its current state.
+
+These two representations should always agree:
+
+```text
+stored account balance
+```
+
+and:
+
+```text
+opening balance + ledger entries
+```
+
+The trade-off is faster balance reads at the cost of needing reconciliation to
+detect divergence caused by bugs, manual database changes, or failed
+invariants. Reconciliation is part of the design, but is not currently exposed
+by the application API.
+
+### Ledger entries are authoritative for financial effects
+
+The financial effect of a transaction is represented by its signed ledger
+entries. A negative entry is a debit, for example `-100.0000`; a positive
+entry is a credit, for example `100.0000`.
+
+Transaction metadata such as source account, destination account, source
+amount, and exchange rate is retained for auditability and interpretation.
+Account history and reversals use persisted ledger entries as the source of
+truth for financial effects. This is especially important for reversals and
+FX transactions, where recomputing amounts from metadata could introduce
+rounding differences.
+
+### Append-only transaction history
+
+Posted transactions and ledger entries are immutable. A correction does not
+edit or delete the original transaction; instead, a reversal creates a new
+`REVERSAL` transaction with entries that are exact sign inverses of the
+original entries.
+
+```text
+Original:
+Account A   -100
+Account B   +100
+
+Reversal:
+Account A   +100
+Account B   -100
+```
+
+This preserves a complete audit trail showing both the original action and
+its correction.
+
+### Two-entry transaction model
+
+Transfers currently produce exactly two ledger entries: a negative amount for
+the source account and a positive amount for the destination account. This is
+sufficient for the exercise.
+
+A production ledger may require additional entries for fees, taxes,
+commissions, settlement, FX clearing, suspense, or intermediary accounts.
+These extensions are outside the current scope.
+
+### Full reversals only
+
+Only full reversals are supported; partial reversals are not modeled. If
+reversing a transaction would cause an account to become negative, the
+reversal is rejected. For example, reversing `A -> B 100` requires debiting
+account B by 100. If B no longer has at least 100 available, the reversal
+fails. This preserves the no-overdraft invariant.
+
+A production system may instead support overdraft facilities, partial
+reversals, manual adjustments, suspense accounts, or exception-handling
+workflows.
+
+### Idempotency
+
+Transfer and reversal requests require an `Idempotency-Key`. The idempotency
+hash is based on financially relevant client request fields. For a transfer,
+these include the operation, source account, destination account, and source
+amount. Server-derived values such as exchange rates, calculated destination
+amounts, timestamps, and balances are not included.
+
+As a result, retrying the same client request returns the originally posted
+transaction rather than recalculating it. For example, if an FX transfer was
+originally posted at `USD -> SGD = 1.35000000` and the configured rate later
+changes, replaying the request with the same key still returns the original
+transaction and rate.
+
+### Concurrency and locking
+
+Account rows are locked pessimistically before balances are changed. All
+affected accounts are locked in deterministic UUID order rather than
+transaction direction. This avoids opposing lock orders for transfers such
+as `A -> B` and `B -> A`, reducing deadlock risk.
+
+Funds are checked only after all affected account locks have been acquired, so
+concurrent transactions do not spend from stale balances.
+
+### Atomic posting
+
+A transaction posts inside one database transaction. The idempotency claim,
+transaction metadata, account balance updates, and ledger entries either all
+commit or all roll back. This prevents partial posting, such as a source debit
+without a destination credit, or transaction metadata without ledger entries.
+The same atomicity rule applies to reversals.
+
+### FX rate authority
+
+The FX provider is deterministic and local for this exercise. The ledger
+treats its provided rate as authoritative. The ledger applies the rate,
+calculates the destination amount using the configured rounding rule, persists
+the exact rate used, and preserves it for auditability and replay.
+
+The ledger does not independently determine whether a rate was economically
+optimal, current, or consistent with external market prices. Live market feeds,
+quote expiry, spreads, fees, rate approvals, provider failover, price
+validation, and market-data reconciliation are outside scope. A production
+system could replace the deterministic provider with an external provider
+behind the same abstraction.
+
+### FX rounding
+
+For a cross-currency transfer:
+
+```text
+destination amount =
+source amount × exchange rate
+```
+
+The final destination amount is rounded to four decimal places using
+`HALF_EVEN`. Intermediate values are not unnecessarily rounded. The persisted
+destination amount and rate become part of the transaction record. Reversals
+do not recalculate the FX conversion; they negate the original persisted
+ledger entries exactly.
+
+### FX value conservation
+
+Different currencies are different units. A USD debit of 100 and SGD credit of
+135 cannot be tested by adding `-100 + 135`; the amounts are not directly
+additive. Instead, an FX transaction can be validated using its persisted
+conversion relationship:
+
+```text
+135 SGD =
+100 USD × 1.35 SGD/USD
+```
+
+The current model can verify that conversion was applied consistently
+according to the stored rate. It does not prove that system-wide economic
+value was preserved relative to an external market price.
+
+### No FX clearing accounts
+
+The exercise uses a simplified two-entry FX model:
+
+```text
+Customer USD   -100 USD
+Customer SGD   +135 SGD
+```
+
+A more accounting-complete production model could introduce separate clearing
+accounts:
+
+```text
+Customer USD      -100 USD
+FX Clearing USD   +100 USD
+
+FX Clearing SGD   -135 SGD
+Customer SGD      +135 SGD
+```
+
+That would allow each currency to balance independently. FX clearing accounts
+are intentionally omitted to keep the exercise focused on posting
+correctness, idempotency, concurrency, and auditability.
+
+### Currency totals
+
+Balances should not be summed directly across different currencies; for
+example, `1000 SGD + 500 USD` is not a meaningful single monetary total.
+System totals are considered separately per currency:
+
+```text
+SGD total = sum of all SGD account balances
+USD total = sum of all USD account balances
+```
+
+A single system-wide value requires a reporting currency and valuation
+exchange rates, which is a reporting or valuation concern rather than a core
+ledger concern.
+
+### Reconciliation model
+
+The designed reconciliation rules compare each account's stored balance with
+its ledger-derived expected balance:
+
+```text
+expected balance =
+opening balance + sum of ledger entries
+```
+
+Aggregate checks should be performed independently per currency. Same-currency
+transfers should net to zero within that currency. FX transactions should be
+checked against their stored conversion relationship rather than by summing
+different currencies. Reversal entries should be exact sign inverses of the
+original entries.
+
+Reconciliation is intended to detect and report discrepancies, not
+automatically repair ledger state. It is not currently implemented as an API
+endpoint.
+
+### Historical reconstruction
+
+Historical balances can be reconstructed from an opening balance plus ledger
+entries through a selected cutoff. The system does not currently persist
+historical balance snapshots. Therefore, an `asOfDate` reconciliation would
+represent a ledger-derived historical reconstruction, not a comparison
+against a separately stored historical account balance.
+
+A production system may persist daily closing balances, reconciliation runs,
+month-end snapshots, or signed accounting periods.
+
+### Scope boundary
+
+The following concerns are outside the current exercise: partial reversals,
+overdrafts, FX clearing accounts, fees and commissions, live FX feeds, rate
+freshness, multi-currency accounts, accounting periods, persisted
+reconciliation runs, authentication and authorization, pagination, scheduled
+reconciliation, and settlement workflows.
+
+These features could be added later without changing the core principles of
+immutable ledger entries, atomic posting, deterministic locking, and
+idempotent requests.
 
 See [docs/design.md](docs/design.md) for the detailed data model, posting and
 concurrency approach, idempotency rules, API behavior, and implementation
