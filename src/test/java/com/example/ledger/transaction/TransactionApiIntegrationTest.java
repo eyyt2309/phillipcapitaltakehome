@@ -12,6 +12,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.lang.NonNull;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -33,6 +34,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import javax.sql.DataSource;
+import org.mockito.Mockito;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
@@ -57,6 +59,8 @@ class TransactionApiIntegrationTest {
             UUID.fromString("00000000-0000-0000-0000-000000000003"));
     private static final UUID HISTORY_OTHER_ACCOUNT = Objects.requireNonNull(
             UUID.fromString("00000000-0000-0000-0000-000000000200"));
+    private static final UUID EUR_ACCOUNT = Objects.requireNonNull(
+            UUID.fromString("00000000-0000-0000-0000-000000000201"));
     private static final List<UUID> CREDIT_SOURCE_IDS = temporaryAccountIds();
 
     @Container
@@ -91,6 +95,9 @@ class TransactionApiIntegrationTest {
     @Autowired
     private RequestHasher requestHasher;
 
+    @MockitoSpyBean
+    private FixedExchangeRateProvider exchangeRateProvider;
+
     @Autowired
     private ObjectMapper objectMapper;
 
@@ -105,6 +112,7 @@ class TransactionApiIntegrationTest {
             jdbcTemplate.update("DELETE FROM accounts WHERE id = ?", accountId);
         }
         jdbcTemplate.update("DELETE FROM accounts WHERE id = ?", HISTORY_OTHER_ACCOUNT);
+        jdbcTemplate.update("DELETE FROM accounts WHERE id = ?", EUR_ACCOUNT);
         jdbcTemplate.update("UPDATE accounts SET balance = opening_balance");
     }
 
@@ -122,6 +130,7 @@ class TransactionApiIntegrationTest {
                 .andExpect(jsonPath("$.destinationAmount").value("100.0000"))
                 .andExpect(jsonPath("$.sourceCurrency").value("SGD"))
                 .andExpect(jsonPath("$.destinationCurrency").value("SGD"))
+                .andExpect(jsonPath("$.exchangeRate").value(org.hamcrest.Matchers.nullValue()))
                 .andExpect(jsonPath("$.createdAt").isNotEmpty())
                 .andExpect(jsonPath("$.idempotencyKey").doesNotExist())
                 .andExpect(jsonPath("$.requestHash").doesNotExist());
@@ -169,6 +178,204 @@ class TransactionApiIntegrationTest {
         assertThat(sourceEntry.add(destinationEntry)).isEqualByComparingTo(BigDecimal.ZERO);
         assertBalanceMatchesOpeningPlusEntries(ACCOUNT_A);
         assertBalanceMatchesOpeningPlusEntries(ACCOUNT_B);
+    }
+
+    @Test
+    void postsUsdToSgdTransferUsingFixedRateAndCurrencySpecificEntries() throws Exception {
+        mockMvc.perform(post("/transactions")
+                        .contentType("application/json")
+                        .header(IDEMPOTENCY_HEADER, "fx-success")
+                        .content(transferJson(ACCOUNT_C, ACCOUNT_B, "100.0000")))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.sourceAmount").value("100.0000"))
+                .andExpect(jsonPath("$.sourceCurrency").value("USD"))
+                .andExpect(jsonPath("$.destinationAmount").value("135.0000"))
+                .andExpect(jsonPath("$.destinationCurrency").value("SGD"))
+                .andExpect(jsonPath("$.exchangeRate").value("1.35000000"))
+                .andExpect(jsonPath("$.idempotencyKey").doesNotExist())
+                .andExpect(jsonPath("$.requestHash").doesNotExist());
+
+        assertBalance(ACCOUNT_C, "900.0000");
+        assertBalance(ACCOUNT_B, "635.0000");
+        assertThat(jdbcTemplate.queryForObject(
+                """
+                SELECT source_amount = 100.0000
+                   AND source_currency = 'USD'
+                   AND destination_amount = 135.0000
+                   AND destination_currency = 'SGD'
+                   AND exchange_rate = 1.35000000
+                FROM ledger_transactions
+                """,
+                Boolean.class
+        )).isTrue();
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT amount FROM ledger_entries WHERE account_id = ?",
+                BigDecimal.class,
+                ACCOUNT_C
+        )).isEqualByComparingTo("-100.0000");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT amount FROM ledger_entries WHERE account_id = ?",
+                BigDecimal.class,
+                ACCOUNT_B
+        )).isEqualByComparingTo("135.0000");
+
+        mockMvc.perform(get("/accounts/{id}/transactions", ACCOUNT_C))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items[0].amount").value("-100.0000"))
+                .andExpect(jsonPath("$.items[0].currency").value("USD"));
+        mockMvc.perform(get("/accounts/{id}/transactions", ACCOUNT_B))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items[0].amount").value("135.0000"))
+                .andExpect(jsonPath("$.items[0].currency").value("SGD"));
+    }
+
+    @Test
+    void unsupportedCurrencyPairDoesNotClaimOrPost() throws Exception {
+        jdbcTemplate.update(
+                """
+                INSERT INTO accounts (id, currency, opening_balance, balance)
+                VALUES (?, 'EUR', 1000.0000, 1000.0000)
+                """,
+                EUR_ACCOUNT
+        );
+
+        mockMvc.perform(post("/transactions")
+                        .contentType("application/json")
+                        .header(IDEMPOTENCY_HEADER, "unsupported-fx")
+                        .content(transferJson(EUR_ACCOUNT, ACCOUNT_B, "100.0000")))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.code").value("UNSUPPORTED_CURRENCY_PAIR"));
+
+        assertBalance(EUR_ACCOUNT, "1000.0000");
+        assertBalance(ACCOUNT_B, "500.0000");
+        assertThat(transactionRepository.count()).isZero();
+        assertThat(ledgerEntryRepository.count()).isZero();
+    }
+
+    @Test
+    void insufficientFundsForFxTransferDoesNotPersistAnything() throws Exception {
+        mockMvc.perform(post("/transactions")
+                        .contentType("application/json")
+                        .header(IDEMPOTENCY_HEADER, "fx-insufficient")
+                        .content(transferJson(ACCOUNT_C, ACCOUNT_B, "1000.0001")))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("INSUFFICIENT_FUNDS"));
+
+        assertBalance(ACCOUNT_C, "1000.0000");
+        assertBalance(ACCOUNT_B, "500.0000");
+        assertThat(transactionRepository.count()).isZero();
+        assertThat(ledgerEntryRepository.count()).isZero();
+    }
+
+    @Test
+    void fxIdempotentReplayReturnsOriginalWithoutMovingBalancesAgain() throws Exception {
+        MvcResult first = mockMvc.perform(post("/transactions")
+                        .contentType("application/json")
+                        .header(IDEMPOTENCY_HEADER, "fx-replay")
+                        .content(transferJson(ACCOUNT_C, ACCOUNT_B, "100.0000")))
+                .andExpect(status().isCreated())
+                .andReturn();
+        TransactionResponse original = objectMapper.readValue(
+                first.getResponse().getContentAsString(),
+                TransactionResponse.class
+        );
+        Mockito.doReturn(new BigDecimal("2.00000000"))
+                .when(exchangeRateProvider).getRate("USD", "SGD");
+
+        MvcResult replay = mockMvc.perform(post("/transactions")
+                        .contentType("application/json")
+                        .header(IDEMPOTENCY_HEADER, "fx-replay")
+                        .content(transferJson(ACCOUNT_C, ACCOUNT_B, "100")))
+                .andExpect(status().isOk())
+                .andReturn();
+        TransactionResponse replayed = objectMapper.readValue(
+                replay.getResponse().getContentAsString(),
+                TransactionResponse.class
+        );
+
+        assertThat(replayed).isEqualTo(original);
+        assertThat(replayed.exchangeRate()).isEqualByComparingTo("1.35000000");
+        assertThat(replayed.destinationAmount()).isEqualByComparingTo("135.0000");
+        assertBalance(ACCOUNT_C, "900.0000");
+        assertBalance(ACCOUNT_B, "635.0000");
+        assertThat(transactionRepository.count()).isEqualTo(1);
+        assertThat(ledgerEntryRepository.count()).isEqualTo(2);
+    }
+
+    @Test
+    void fxDestinationAmountUsesHalfEvenRounding() {
+        Mockito.doReturn(new BigDecimal("1.23445000"))
+                .when(exchangeRateProvider).getRate("USD", "SGD");
+
+        TransferResult result = transactionService.transfer(
+                new TransferRequest(ACCOUNT_C, ACCOUNT_B, new BigDecimal("1.0000")),
+                "fx-half-even"
+        );
+
+        assertThat(result.response().destinationAmount()).isEqualByComparingTo("1.2344");
+        assertThat(result.response().exchangeRate()).isEqualByComparingTo("1.23445000");
+        assertBalance(ACCOUNT_C, "999.0000");
+        assertBalance(ACCOUNT_B, "501.2344");
+    }
+
+    @Test
+    void concurrentFxTransfersCannotOverdrawSourceAndCreditsAreNotLost() throws Exception {
+        List<TransferRequest> requests = new ArrayList<>();
+        List<String> keys = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            requests.add(new TransferRequest(ACCOUNT_C, ACCOUNT_B, new BigDecimal("100.0000")));
+            keys.add("concurrent-fx-" + i);
+        }
+
+        List<ConcurrentAttempt> attempts = runConcurrently(requests, keys);
+
+        assertThat(attempts.stream().filter(result -> result.result() != null).count()).isEqualTo(10);
+        assertThat(attempts.stream()
+                .filter(result -> result.failure() instanceof InsufficientFundsException)
+                .count()).isEqualTo(10);
+        assertBalance(ACCOUNT_C, "0.0000");
+        assertBalance(ACCOUNT_B, "1850.0000");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT SUM(amount) FROM ledger_entries WHERE account_id = ?",
+                BigDecimal.class,
+                ACCOUNT_C
+        )).isEqualByComparingTo("-1000.0000");
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT SUM(amount) FROM ledger_entries WHERE account_id = ?",
+                BigDecimal.class,
+                ACCOUNT_B
+        )).isEqualByComparingTo("1350.0000");
+        assertThat(transactionRepository.count()).isEqualTo(10);
+        assertThat(ledgerEntryRepository.count()).isEqualTo(20);
+    }
+
+    @Test
+    void reversalOfFxTransferInvertsPersistedEntriesAndPreservesRate() throws Exception {
+        TransactionResponse original = postTransfer(
+                ACCOUNT_C, ACCOUNT_B, "100.0000", "fx-reversal-original"
+        );
+        MvcResult reversalResult = mockMvc.perform(post(
+                                "/transactions/{transactionId}/reversals",
+                                original.transactionId()
+                        )
+                        .header(IDEMPOTENCY_HEADER, "fx-reversal"))
+                .andExpect(status().isCreated())
+                .andReturn();
+        TransactionResponse reversal = objectMapper.readValue(
+                reversalResult.getResponse().getContentAsString(),
+                TransactionResponse.class
+        );
+
+        assertThat(reversal.type()).isEqualTo(TransactionType.REVERSAL);
+        assertThat(reversal.reversalOf()).isEqualTo(original.transactionId());
+        assertThat(reversal.exchangeRate()).isEqualByComparingTo("1.35000000");
+        assertThat(reversal.destinationAmount()).isEqualByComparingTo("135.0000");
+        assertLedgerEffect(original.transactionId(), ACCOUNT_C, "-100.0000");
+        assertLedgerEffect(original.transactionId(), ACCOUNT_B, "135.0000");
+        assertLedgerEffect(reversal.transactionId(), ACCOUNT_C, "100.0000");
+        assertLedgerEffect(reversal.transactionId(), ACCOUNT_B, "-135.0000");
+        assertBalance(ACCOUNT_C, "1000.0000");
+        assertBalance(ACCOUNT_B, "500.0000");
     }
 
     @Test
@@ -444,18 +651,21 @@ class TransactionApiIntegrationTest {
     }
 
     @Test
-    void currencyMismatchIsRejectedWithoutChanges() throws Exception {
+    void supportedCurrencyPairPostsFxTransfer() throws Exception {
         mockMvc.perform(post("/transactions")
                         .contentType("application/json")
                         .header(IDEMPOTENCY_HEADER, IDEMPOTENCY_KEY)
                         .content(transferJson(ACCOUNT_A, ACCOUNT_C, "100.0000")))
-                .andExpect(status().isUnprocessableEntity())
-                .andExpect(jsonPath("$.code").value("CURRENCY_MISMATCH"));
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.sourceCurrency").value("SGD"))
+                .andExpect(jsonPath("$.destinationCurrency").value("USD"))
+                .andExpect(jsonPath("$.destinationAmount").value("74.0741"))
+                .andExpect(jsonPath("$.exchangeRate").value("0.74074074"));
 
-        assertBalance(ACCOUNT_A, "1000.0000");
-        assertBalance(ACCOUNT_C, "1000.0000");
-        assertThat(transactionRepository.count()).isZero();
-        assertThat(ledgerEntryRepository.count()).isZero();
+        assertBalance(ACCOUNT_A, "900.0000");
+        assertBalance(ACCOUNT_C, "1074.0741");
+        assertThat(transactionRepository.count()).isEqualTo(1);
+        assertThat(ledgerEntryRepository.count()).isEqualTo(2);
     }
 
     @Test

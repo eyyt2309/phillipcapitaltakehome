@@ -275,7 +275,7 @@ public interface ExchangeRateProvider {
 }
 ```
 
-Use a deterministic in-memory/configuration-backed implementation for the take-home, with a small documented set of supported pairs and rates. It avoids a live API, network failures, caching, and rate-expiry scope while allowing a future provider to be substituted. Tests inject fixed rates. Unsupported pairs are rejected.
+Use a deterministic local implementation for the take-home with these supported pairs: USD-to-SGD at `1.35000000` and SGD-to-USD at `0.74074074`. It avoids a live API, network failures, caching, and rate-expiry scope while allowing a future provider to be substituted. Tests use deterministic rates. Unsupported pairs are rejected.
 
 Interpret the rate as destination currency units per one source currency unit. Calculate:
 

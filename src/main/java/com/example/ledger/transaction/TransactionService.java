@@ -23,17 +23,20 @@ public class TransactionService {
     private final TransactionRepository transactionRepository;
     private final LedgerEntryRepository ledgerEntryRepository;
     private final RequestHasher requestHasher;
+    private final ExchangeRateProvider exchangeRateProvider;
 
     public TransactionService(
             AccountRepository accountRepository,
             TransactionRepository transactionRepository,
             LedgerEntryRepository ledgerEntryRepository,
-            RequestHasher requestHasher
+            RequestHasher requestHasher,
+            ExchangeRateProvider exchangeRateProvider
     ) {
         this.accountRepository = accountRepository;
         this.transactionRepository = transactionRepository;
         this.ledgerEntryRepository = ledgerEntryRepository;
         this.requestHasher = requestHasher;
+        this.exchangeRateProvider = exchangeRateProvider;
     }
 
     @Transactional(isolation = Isolation.READ_COMMITTED)
@@ -56,11 +59,18 @@ public class TransactionService {
                 .orElseThrow(() -> new AccountNotFoundException(sourceAccountId));
         Account destinationMetadata = accountRepository.findById(destinationAccountId)
                 .orElseThrow(() -> new AccountNotFoundException(destinationAccountId));
-        if (!sourceMetadata.getCurrency().equals(destinationMetadata.getCurrency())) {
-            throw new CurrencyMismatchException(
-                    sourceMetadata.getCurrency(),
-                    destinationMetadata.getCurrency()
-            );
+        String sourceCurrency = sourceMetadata.getCurrency();
+        String destinationCurrency = destinationMetadata.getCurrency();
+        BigDecimal exchangeRate = null;
+        BigDecimal destinationAmount = amount;
+        if (!sourceCurrency.equals(destinationCurrency)) {
+            exchangeRate = exchangeRateProvider.getRate(sourceCurrency, destinationCurrency)
+                    .setScale(8, RoundingMode.UNNECESSARY);
+            if (exchangeRate.compareTo(BigDecimal.ZERO) <= 0) {
+                throw new IllegalStateException("Configured exchange rates must be positive.");
+            }
+            destinationAmount = amount.multiply(exchangeRate)
+                    .setScale(4, RoundingMode.HALF_EVEN);
         }
 
         UUID transactionId = Objects.requireNonNull(UUID.randomUUID());
@@ -69,8 +79,10 @@ public class TransactionService {
                 sourceAccountId,
                 destinationAccountId,
                 amount,
-                sourceMetadata.getCurrency(),
-                destinationMetadata.getCurrency(),
+                sourceCurrency,
+                destinationCurrency,
+                destinationAmount,
+                exchangeRate,
                 idempotencyKey,
                 requestHash
         );
@@ -108,7 +120,8 @@ public class TransactionService {
                 ? firstAccount
                 : secondAccount;
 
-        if (!sourceAccount.getCurrency().equals(destinationAccount.getCurrency())) {
+        if (!sourceAccount.getCurrency().equals(sourceCurrency)
+                || !destinationAccount.getCurrency().equals(destinationCurrency)) {
             throw new CurrencyMismatchException(
                     sourceAccount.getCurrency(),
                     destinationAccount.getCurrency()
@@ -120,13 +133,13 @@ public class TransactionService {
         }
 
         sourceAccount.setBalance(sourceAccount.getBalance().subtract(amount));
-        destinationAccount.setBalance(destinationAccount.getBalance().add(amount));
+        destinationAccount.setBalance(destinationAccount.getBalance().add(destinationAmount));
 
         ledgerEntryRepository.save(
                 new LedgerEntry(UUID.randomUUID(), transaction, sourceAccount, amount.negate())
         );
         ledgerEntryRepository.save(
-                new LedgerEntry(UUID.randomUUID(), transaction, destinationAccount, amount)
+                new LedgerEntry(UUID.randomUUID(), transaction, destinationAccount, destinationAmount)
         );
 
         return new TransferResult(toResponse(transaction), false);
@@ -227,6 +240,7 @@ public class TransactionService {
                 transaction.getDestinationAmount(),
                 transaction.getSourceCurrency(),
                 transaction.getDestinationCurrency(),
+                transaction.getExchangeRate(),
                 transaction.getCreatedAt()
         );
     }

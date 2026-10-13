@@ -20,6 +20,8 @@ public record TransactionResponse(
         BigDecimal destinationAmount,
         String sourceCurrency,
         String destinationCurrency,
+        @JsonSerialize(using = ToStringSerializer.class)
+        BigDecimal exchangeRate,
         Instant createdAt
 ) {
 }

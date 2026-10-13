@@ -8,6 +8,7 @@ import com.example.ledger.transaction.InsufficientFundsException;
 import com.example.ledger.transaction.ReversalNotAllowedException;
 import com.example.ledger.transaction.SelfTransferException;
 import com.example.ledger.transaction.TransactionNotFoundException;
+import com.example.ledger.transaction.UnsupportedCurrencyPairException;
 import jakarta.validation.ConstraintViolationException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
@@ -71,6 +72,20 @@ public class ApiExceptionHandler {
                 HttpStatus.UNPROCESSABLE_ENTITY.value(),
                 "Currency mismatch",
                 "CURRENCY_MISMATCH",
+                exception,
+                request
+        );
+    }
+
+    @ExceptionHandler(UnsupportedCurrencyPairException.class)
+    public ProblemDetail handleUnsupportedCurrencyPair(
+            UnsupportedCurrencyPairException exception,
+            HttpServletRequest request
+    ) {
+        return problem(
+                HttpStatus.UNPROCESSABLE_ENTITY.value(),
+                "Unsupported currency pair",
+                "UNSUPPORTED_CURRENCY_PAIR",
                 exception,
                 request
         );
