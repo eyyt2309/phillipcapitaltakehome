@@ -701,6 +701,322 @@ class TransactionApiIntegrationTest {
         assertBalance(ACCOUNT_B, "600.0000");
     }
 
+    @Test
+    void successfulReversalInvertsEntriesPreservesOriginalAndAppearsInHistory() throws Exception {
+        TransactionResponse original = postTransfer(
+                ACCOUNT_A, ACCOUNT_B, "100.0000", "reversal-original"
+        );
+        String originalCreatedAt = jdbcTemplate.queryForObject(
+                "SELECT created_at::text FROM ledger_transactions WHERE id = ?",
+                String.class,
+                original.transactionId()
+        );
+
+        MvcResult result = mockMvc.perform(post(
+                                "/transactions/{transactionId}/reversals",
+                                original.transactionId()
+                        )
+                        .header(IDEMPOTENCY_HEADER, "reversal-success"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.type").value("REVERSAL"))
+                .andExpect(jsonPath("$.reversalOf").value(original.transactionId().toString()))
+                .andExpect(jsonPath("$.status").value("POSTED"))
+                .andReturn();
+        TransactionResponse reversal = objectMapper.readValue(
+                result.getResponse().getContentAsString(),
+                TransactionResponse.class
+        );
+
+        assertThat(reversal.sourceAccountId()).isEqualTo(original.sourceAccountId());
+        assertThat(reversal.destinationAccountId()).isEqualTo(original.destinationAccountId());
+        assertThat(reversal.sourceAmount()).isEqualByComparingTo(original.sourceAmount());
+        assertThat(reversal.destinationAmount()).isEqualByComparingTo(original.destinationAmount());
+        assertThat(reversal.sourceCurrency()).isEqualTo(original.sourceCurrency());
+        assertThat(reversal.destinationCurrency()).isEqualTo(original.destinationCurrency());
+        assertBalance(ACCOUNT_A, "1000.0000");
+        assertBalance(ACCOUNT_B, "500.0000");
+        assertThat(transactionRepository.count()).isEqualTo(2);
+        assertThat(ledgerEntryRepository.count()).isEqualTo(4);
+        assertThat(jdbcTemplate.queryForObject(
+                """
+                SELECT transaction_type = 'TRANSFER'
+                   AND reversal_of IS NULL
+                   AND created_at::text = ?
+                FROM ledger_transactions
+                WHERE id = ?
+                """,
+                Boolean.class,
+                originalCreatedAt,
+                original.transactionId()
+        )).isTrue();
+        assertLedgerEffect(original.transactionId(), ACCOUNT_A, "-100.0000");
+        assertLedgerEffect(original.transactionId(), ACCOUNT_B, "100.0000");
+        assertLedgerEffect(reversal.transactionId(), ACCOUNT_A, "100.0000");
+        assertLedgerEffect(reversal.transactionId(), ACCOUNT_B, "-100.0000");
+        assertBalanceMatchesOpeningPlusEntries(ACCOUNT_A);
+        assertBalanceMatchesOpeningPlusEntries(ACCOUNT_B);
+
+        mockMvc.perform(get("/accounts/{id}/transactions", ACCOUNT_A))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items.length()").value(2))
+                .andExpect(jsonPath("$.items[0].transactionId")
+                        .value(original.transactionId().toString()))
+                .andExpect(jsonPath("$.items[0].amount").value("-100.0000"))
+                .andExpect(jsonPath("$.items[1].transactionId")
+                        .value(reversal.transactionId().toString()))
+                .andExpect(jsonPath("$.items[1].type").value("REVERSAL"))
+                .andExpect(jsonPath("$.items[1].amount").value("100.0000"))
+                .andExpect(jsonPath("$.items[1].reversalOf")
+                        .value(original.transactionId().toString()));
+        mockMvc.perform(get("/accounts/{id}/transactions", ACCOUNT_B))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items.length()").value(2))
+                .andExpect(jsonPath("$.items[0].amount").value("100.0000"))
+                .andExpect(jsonPath("$.items[1].amount").value("-100.0000"));
+    }
+
+    @Test
+    void duplicateReversalWithDifferentKeysIsRejected() throws Exception {
+        TransactionResponse original = postTransfer(
+                ACCOUNT_A, ACCOUNT_B, "100.0000", "duplicate-reversal-original"
+        );
+        mockMvc.perform(post("/transactions/{transactionId}/reversals", original.transactionId())
+                        .header(IDEMPOTENCY_HEADER, "duplicate-reversal-first"))
+                .andExpect(status().isCreated());
+
+        mockMvc.perform(post("/transactions/{transactionId}/reversals", original.transactionId())
+                        .header(IDEMPOTENCY_HEADER, "duplicate-reversal-second"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("DUPLICATE_REVERSAL"));
+
+        assertThat(transactionRepository.count()).isEqualTo(2);
+        assertThat(ledgerEntryRepository.count()).isEqualTo(4);
+        assertBalance(ACCOUNT_A, "1000.0000");
+        assertBalance(ACCOUNT_B, "500.0000");
+    }
+
+    @Test
+    void reversalReplayReturnsOriginalReversalWithoutPostingAgain() throws Exception {
+        TransactionResponse original = postTransfer(
+                ACCOUNT_A, ACCOUNT_B, "100.0000", "replay-reversal-original"
+        );
+        MvcResult first = mockMvc.perform(post(
+                                "/transactions/{transactionId}/reversals",
+                                original.transactionId()
+                        )
+                        .header(IDEMPOTENCY_HEADER, "reversal-replay-key"))
+                .andExpect(status().isCreated())
+                .andReturn();
+        TransactionResponse firstResponse = objectMapper.readValue(
+                first.getResponse().getContentAsString(),
+                TransactionResponse.class
+        );
+        MvcResult replay = mockMvc.perform(post(
+                                "/transactions/{transactionId}/reversals",
+                                original.transactionId()
+                        )
+                        .header(IDEMPOTENCY_HEADER, "reversal-replay-key"))
+                .andExpect(status().isOk())
+                .andReturn();
+        TransactionResponse replayResponse = objectMapper.readValue(
+                replay.getResponse().getContentAsString(),
+                TransactionResponse.class
+        );
+
+        assertThat(replayResponse).isEqualTo(firstResponse);
+        assertThat(transactionRepository.count()).isEqualTo(2);
+        assertThat(ledgerEntryRepository.count()).isEqualTo(4);
+        assertBalance(ACCOUNT_A, "1000.0000");
+        assertBalance(ACCOUNT_B, "500.0000");
+    }
+
+    @Test
+    void reversalIdempotencyKeyCannotBeReusedForAnotherTarget() throws Exception {
+        TransactionResponse first = postTransfer(
+                ACCOUNT_A, ACCOUNT_B, "100.0000", "different-target-first"
+        );
+        TransactionResponse second = postTransfer(
+                ACCOUNT_A, ACCOUNT_B, "50.0000", "different-target-second"
+        );
+        mockMvc.perform(post("/transactions/{transactionId}/reversals", first.transactionId())
+                        .header(IDEMPOTENCY_HEADER, "reversal-target-key"))
+                .andExpect(status().isCreated());
+
+        mockMvc.perform(post("/transactions/{transactionId}/reversals", second.transactionId())
+                        .header(IDEMPOTENCY_HEADER, "reversal-target-key"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("IDEMPOTENCY_KEY_REUSED"));
+
+        assertThat(transactionRepository.count()).isEqualTo(3);
+        assertThat(ledgerEntryRepository.count()).isEqualTo(6);
+    }
+
+    @Test
+    void reversalOfReversalIsRejected() throws Exception {
+        TransactionResponse original = postTransfer(
+                ACCOUNT_A, ACCOUNT_B, "100.0000", "reverse-of-reversal-original"
+        );
+        MvcResult reversalResult = mockMvc.perform(post(
+                                "/transactions/{transactionId}/reversals",
+                                original.transactionId()
+                        )
+                        .header(IDEMPOTENCY_HEADER, "reverse-of-reversal-first"))
+                .andExpect(status().isCreated())
+                .andReturn();
+        TransactionResponse reversal = objectMapper.readValue(
+                reversalResult.getResponse().getContentAsString(),
+                TransactionResponse.class
+        );
+
+        mockMvc.perform(post("/transactions/{transactionId}/reversals", reversal.transactionId())
+                        .header(IDEMPOTENCY_HEADER, "reverse-the-reversal"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("REVERSAL_NOT_ALLOWED"));
+
+        assertThat(transactionRepository.count()).isEqualTo(2);
+        assertThat(ledgerEntryRepository.count()).isEqualTo(4);
+        assertBalance(ACCOUNT_A, "1000.0000");
+        assertBalance(ACCOUNT_B, "500.0000");
+    }
+
+    @Test
+    void insufficientFundsForReversalRollsBackWithoutPartialChanges() throws Exception {
+        TransactionResponse original = postTransfer(
+                ACCOUNT_A, ACCOUNT_B, "100.0000", "reversal-insufficient-original"
+        );
+        postTransfer(ACCOUNT_B, ACCOUNT_A, "550.0000", "spend-before-reversal");
+
+        mockMvc.perform(post("/transactions/{transactionId}/reversals", original.transactionId())
+                        .header(IDEMPOTENCY_HEADER, "reversal-insufficient-key"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("INSUFFICIENT_FUNDS"));
+
+        assertBalance(ACCOUNT_A, "1450.0000");
+        assertBalance(ACCOUNT_B, "50.0000");
+        assertThat(transactionRepository.count()).isEqualTo(2);
+        assertThat(ledgerEntryRepository.count()).isEqualTo(4);
+    }
+
+    @Test
+    void concurrentAttemptsToReverseOneTransferCommitExactlyOneReversal() throws Exception {
+        TransactionResponse original = postTransfer(
+                ACCOUNT_A, ACCOUNT_B, "100.0000", "concurrent-reversal-original"
+        );
+        List<ReversalAttempt> attempts = runConcurrentReversals(
+                original.transactionId(),
+                List.of("concurrent-reversal-one", "concurrent-reversal-two")
+        );
+
+        assertThat(attempts.stream().filter(attempt -> attempt.result() != null).count())
+                .isEqualTo(1);
+        assertThat(attempts.stream()
+                .filter(attempt -> attempt.failure() instanceof DuplicateReversalException)
+                .count()).isEqualTo(1);
+        assertThat(transactionRepository.count()).isEqualTo(2);
+        assertThat(ledgerEntryRepository.count()).isEqualTo(4);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM ledger_transactions WHERE transaction_type = 'REVERSAL'",
+                Integer.class
+        )).isEqualTo(1);
+        assertBalance(ACCOUNT_A, "1000.0000");
+        assertBalance(ACCOUNT_B, "500.0000");
+    }
+
+    @Test
+    void failureDuringReversalPostingRollsBackAllReversalState() throws Exception {
+        TransactionResponse original = postTransfer(
+                ACCOUNT_A, ACCOUNT_B, "100.0000", "reversal-rollback-original"
+        );
+        installFailingLedgerEntryTrigger();
+        try {
+            Throwable failure = catchThrowable(() -> transactionService.reverse(
+                    original.transactionId(),
+                    "reversal-rollback-key"
+            ));
+            assertThat(failure).isNotNull();
+        } finally {
+            removeFailingLedgerEntryTrigger();
+        }
+
+        assertBalance(ACCOUNT_A, "900.0000");
+        assertBalance(ACCOUNT_B, "600.0000");
+        assertThat(transactionRepository.count()).isEqualTo(1);
+        assertThat(ledgerEntryRepository.count()).isEqualTo(2);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM ledger_transactions WHERE transaction_type = 'REVERSAL'",
+                Integer.class
+        )).isZero();
+    }
+
+    @Test
+    void failedReversalDoesNotPermanentlyReserveItsIdempotencyKey() throws Exception {
+        TransactionResponse original = postTransfer(
+                ACCOUNT_A, ACCOUNT_B, "100.0000", "reversal-key-retry-original"
+        );
+        installFailingLedgerEntryTrigger();
+        try {
+            Throwable failure = catchThrowable(() -> transactionService.reverse(
+                    original.transactionId(),
+                    "reversal-key-retry"
+            ));
+            assertThat(failure).isNotNull();
+        } finally {
+            removeFailingLedgerEntryTrigger();
+        }
+
+        TransferResult retry = transactionService.reverse(
+                original.transactionId(),
+                "reversal-key-retry"
+        );
+
+        assertThat(retry.replayed()).isFalse();
+        assertThat(retry.response().type()).isEqualTo(TransactionType.REVERSAL);
+        assertThat(transactionRepository.count()).isEqualTo(2);
+        assertThat(ledgerEntryRepository.count()).isEqualTo(4);
+        assertBalance(ACCOUNT_A, "1000.0000");
+        assertBalance(ACCOUNT_B, "500.0000");
+    }
+
+    private List<ReversalAttempt> runConcurrentReversals(
+            UUID originalTransactionId,
+            List<String> idempotencyKeys
+    ) throws Exception {
+        ExecutorService executor = Executors.newFixedThreadPool(idempotencyKeys.size());
+        CountDownLatch ready = new CountDownLatch(idempotencyKeys.size());
+        CountDownLatch start = new CountDownLatch(1);
+        try {
+            List<Future<ReversalAttempt>> futures = new ArrayList<>();
+            for (String key : idempotencyKeys) {
+                futures.add(executor.submit(() -> {
+                    ready.countDown();
+                    if (!start.await(10, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("Concurrent reversal start timed out.");
+                    }
+                    try {
+                        return new ReversalAttempt(
+                                transactionService.reverse(originalTransactionId, key),
+                                null
+                        );
+                    } catch (RuntimeException exception) {
+                        return new ReversalAttempt(null, exception);
+                    }
+                }));
+            }
+            assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue();
+            start.countDown();
+
+            List<ReversalAttempt> attempts = new ArrayList<>();
+            for (Future<ReversalAttempt> future : futures) {
+                attempts.add(future.get(30, TimeUnit.SECONDS));
+            }
+            return attempts;
+        } finally {
+            start.countDown();
+            executor.shutdownNow();
+            assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+        }
+    }
+
     private List<ConcurrentAttempt> runConcurrently(
             List<TransferRequest> requests,
             List<String> idempotencyKeys
@@ -763,6 +1079,16 @@ class TransactionApiIntegrationTest {
                 result.getResponse().getContentAsString(),
                 TransactionResponse.class
         );
+    }
+
+    private void assertLedgerEffect(UUID transactionId, UUID accountId, String amount) {
+        BigDecimal actual = jdbcTemplate.queryForObject(
+                "SELECT amount FROM ledger_entries WHERE transaction_id = ? AND account_id = ?",
+                BigDecimal.class,
+                transactionId,
+                accountId
+        );
+        assertThat(actual).isEqualByComparingTo(amount);
     }
 
     private void awaitBlockedClaims(int expectedCount) throws InterruptedException {
@@ -913,5 +1239,8 @@ class TransactionApiIntegrationTest {
     }
 
     private record ConcurrentAttempt(TransferResult result, RuntimeException failure) {
+    }
+
+    private record ReversalAttempt(TransferResult result, RuntimeException failure) {
     }
 }

@@ -2,9 +2,12 @@ package com.example.ledger.common;
 
 import com.example.ledger.account.AccountNotFoundException;
 import com.example.ledger.transaction.CurrencyMismatchException;
+import com.example.ledger.transaction.DuplicateReversalException;
 import com.example.ledger.transaction.IdempotencyConflictException;
 import com.example.ledger.transaction.InsufficientFundsException;
+import com.example.ledger.transaction.ReversalNotAllowedException;
 import com.example.ledger.transaction.SelfTransferException;
+import com.example.ledger.transaction.TransactionNotFoundException;
 import jakarta.validation.ConstraintViolationException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
@@ -82,6 +85,48 @@ public class ApiExceptionHandler {
                 HttpStatus.CONFLICT.value(),
                 "Idempotency key reused",
                 "IDEMPOTENCY_KEY_REUSED",
+                exception,
+                request
+        );
+    }
+
+    @ExceptionHandler(TransactionNotFoundException.class)
+    public ProblemDetail handleTransactionNotFound(
+            TransactionNotFoundException exception,
+            HttpServletRequest request
+    ) {
+        return problem(
+                HttpStatus.NOT_FOUND.value(),
+                "Transaction not found",
+                "TRANSACTION_NOT_FOUND",
+                exception,
+                request
+        );
+    }
+
+    @ExceptionHandler(DuplicateReversalException.class)
+    public ProblemDetail handleDuplicateReversal(
+            DuplicateReversalException exception,
+            HttpServletRequest request
+    ) {
+        return problem(
+                HttpStatus.CONFLICT.value(),
+                "Transaction already reversed",
+                "DUPLICATE_REVERSAL",
+                exception,
+                request
+        );
+    }
+
+    @ExceptionHandler(ReversalNotAllowedException.class)
+    public ProblemDetail handleReversalNotAllowed(
+            ReversalNotAllowedException exception,
+            HttpServletRequest request
+    ) {
+        return problem(
+                HttpStatus.CONFLICT.value(),
+                "Reversal not allowed",
+                "REVERSAL_NOT_ALLOWED",
                 exception,
                 request
         );

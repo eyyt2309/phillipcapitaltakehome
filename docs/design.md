@@ -183,9 +183,9 @@ Returns the transactions affecting the account in ascending `created_at, id` ord
 
 ### `POST /transactions/{id}/reversals`
 
-Requires `Idempotency-Key`; creates a full reversal as a new transaction and returns `201 Created`. It references the original using `reversal_of`. Only one full reversal is allowed per transaction.
+Requires `Idempotency-Key`; creates a full reversal as a new transaction and returns `201 Created`. Replaying the same key and target returns the original reversal with `200 OK`; reusing the key for a different target or attempting a second full reversal returns `409 Conflict`.
 
-The reversal transaction retains the original transfer's account and amount/rate metadata for auditability; its two new ledger entries have the opposite signs of the original entries. The entries, rather than the transaction's descriptive source/destination fields, express the reversal's balance effects.
+The reversal transaction retains the original transfer's account and amount/rate metadata for auditability; its new ledger entries are exact sign-inverted copies of the original entries. Derive effects from those entries, not from transaction metadata. The entries, rather than the transaction's descriptive source/destination fields, express the reversal's balance effects. Reversal request hashing uses `REVERSAL|<original transaction id>`.
 
 Example response:
 
@@ -262,6 +262,8 @@ After those checks, use a PostgreSQL `INSERT ... ON CONFLICT DO NOTHING` claim i
 A reversal is a new immutable transaction, never an edit or deletion. For a reversal row, `source_account_id`, `destination_account_id`, `source_amount`, `destination_amount`, currencies, and exchange rate are **metadata copied from the original transfer**, not a claim about the direction of the reversal. The actual reversal direction/effect is expressed by its new ledger entries: apply the exact opposite signed amounts to the same accounts. Store `transaction_type = 'REVERSAL'` and `reversal_of = original.id`; the unique constraint prevents a second full reversal.
 
 Only posted transfers may be reversed. The reversal itself requires an idempotency key. **Assumption:** if reversing would make an account negative, reject with `409 Conflict`; partial reversals and reversal-of-reversal are out of scope. The original and reversal remain visible in history.
+
+The reversal row is claimed with PostgreSQL `ON CONFLICT DO NOTHING`, including the unique `reversal_of` constraint as the final protection against concurrent duplicate reversals. The claim, account updates, and inverse ledger entries share one `READ COMMITTED` transaction. Lock every account affected by the original ledger entries in ascending UUID order before checking projected balances or posting; a failed funds check or ledger write rolls the claim and all other writes back.
 
 ## 8. Foreign-exchange transfers
 

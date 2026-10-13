@@ -7,6 +7,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.UUID;
 
 @Component
 public class RequestHasher {
@@ -16,6 +17,14 @@ public class RequestHasher {
                 + request.sourceAccountId() + "|"
                 + request.destinationAccountId() + "|"
                 + request.amount().setScale(4, RoundingMode.UNNECESSARY).toPlainString();
+        return hash(canonicalRequest);
+    }
+
+    public String hashReversal(UUID originalTransactionId) {
+        return hash("REVERSAL|" + originalTransactionId);
+    }
+
+    private String hash(String canonicalRequest) {
         try {
             byte[] digest = MessageDigest.getInstance("SHA-256")
                     .digest(canonicalRequest.getBytes(StandardCharsets.UTF_8));

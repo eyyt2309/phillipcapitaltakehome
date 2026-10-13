@@ -9,7 +9,9 @@ import java.util.UUID;
 
 public record TransactionResponse(
         UUID transactionId,
+        TransactionType type,
         String status,
+        UUID reversalOf,
         UUID sourceAccountId,
         UUID destinationAccountId,
         @JsonSerialize(using = ToStringSerializer.class)

@@ -9,7 +9,11 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
 import java.util.UUID;
 
 @Service
@@ -128,6 +132,82 @@ public class TransactionService {
         return new TransferResult(toResponse(transaction), false);
     }
 
+    @Transactional(isolation = Isolation.READ_COMMITTED)
+    public TransferResult reverse(UUID originalTransactionId, String idempotencyKey) {
+        String requestHash = requestHasher.hashReversal(originalTransactionId);
+        var existing = transactionRepository.findByIdempotencyKey(idempotencyKey);
+        if (existing.isPresent()) {
+            return existingResult(existing.get(), requestHash);
+        }
+
+        LedgerTransaction original = transactionRepository.findWithAccountsById(originalTransactionId)
+                .orElseThrow(() -> new TransactionNotFoundException(originalTransactionId));
+        if (original.getTransactionType() != TransactionType.TRANSFER) {
+            throw new ReversalNotAllowedException();
+        }
+
+        UUID reversalId = UUID.randomUUID();
+        int claimed = transactionRepository.claimReversal(
+                reversalId,
+                originalTransactionId,
+                idempotencyKey,
+                requestHash
+        );
+        if (claimed == 0) {
+            LedgerTransaction winner = transactionRepository.findByIdempotencyKey(idempotencyKey)
+                    .orElse(null);
+            if (winner != null) {
+                return existingResult(winner, requestHash);
+            }
+            throw new DuplicateReversalException();
+        }
+
+        LedgerTransaction reversal = transactionRepository.findById(reversalId)
+                .orElseThrow(() -> new IllegalStateException(
+                        "The successful reversal claim could not be loaded."
+                ));
+        List<LedgerEntryEffect> originalEffects =
+                ledgerEntryRepository.findAllEffectsByTransactionId(originalTransactionId);
+        if (originalEffects.isEmpty()) {
+            throw new IllegalStateException("The original transfer has no ledger entries.");
+        }
+
+        Map<UUID, BigDecimal> balanceChanges = new TreeMap<>();
+        for (LedgerEntryEffect effect : originalEffects) {
+            balanceChanges.merge(effect.accountId(), effect.amount().negate(), BigDecimal::add);
+        }
+
+        Map<UUID, Account> lockedAccounts = new TreeMap<>();
+        for (UUID accountId : balanceChanges.keySet()) {
+            Account account = accountRepository.findByIdForUpdate(accountId)
+                    .orElseThrow(() -> new AccountNotFoundException(accountId));
+            lockedAccounts.put(accountId, account);
+        }
+
+        for (Map.Entry<UUID, BigDecimal> change : balanceChanges.entrySet()) {
+            Account account = lockedAccounts.get(change.getKey());
+            BigDecimal reversedBalance = account.getBalance().add(change.getValue());
+            if (reversedBalance.compareTo(BigDecimal.ZERO) < 0) {
+                throw new InsufficientFundsException();
+            }
+            account.setBalance(reversedBalance);
+        }
+
+        List<LedgerEntry> reversedEntries = new ArrayList<>(originalEffects.size());
+        for (LedgerEntryEffect originalEffect : originalEffects) {
+            Account account = lockedAccounts.get(originalEffect.accountId());
+            reversedEntries.add(new LedgerEntry(
+                    UUID.randomUUID(),
+                    reversal,
+                    account,
+                    originalEffect.amount().negate()
+            ));
+        }
+        ledgerEntryRepository.saveAll(reversedEntries);
+
+        return new TransferResult(toResponse(reversal), false);
+    }
+
     private TransferResult existingResult(LedgerTransaction transaction, String requestHash) {
         if (!transaction.getRequestHash().equals(requestHash)) {
             throw new IdempotencyConflictException();
@@ -138,7 +218,9 @@ public class TransactionService {
     private TransactionResponse toResponse(LedgerTransaction transaction) {
         return new TransactionResponse(
                 transaction.getId(),
+                transaction.getTransactionType(),
                 "POSTED",
+                transaction.getReversalOf(),
                 transaction.getSourceAccount().getId(),
                 transaction.getDestinationAccount().getId(),
                 transaction.getSourceAmount(),
